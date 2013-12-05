@@ -26,7 +26,7 @@ optional arguments:
                         EC2 API compatible filter with which to find
                         instances, ex. 'tag:replicaset,importantthings' will find
                         instances with the tag 'replicaset' and a value of
-                        'importantthings'. Multiple filters can be separated by with
+                        'importantthings'. Multiple filters can be separated with
                         a semicolon.
   -k SSHKEYFILE, --ssh-keyfile SSHKEYFILE
                         Path to SSH key file to use.
