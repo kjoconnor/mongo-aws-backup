@@ -5,7 +5,7 @@ mongo-aws-backup
 
 Python script to discover and backup MongoDB replica sets hosted on EC2.
 
-This requires that you are running MongoDB on EC2 on Linux and are using EC2 tags to help manage your MongoDB replica sets.  For instance, we use tags like 'replicaset' with values that represent what replica set they are a part of, but they can really be any EC2 API compatible filter.  Wherever you run this script from will need access to Mongo (typically port 27017) and SSH access, and have your SSH keyfile available to it.
+This requires that you are running MongoDB on EC2 on Linux and are using some type of EC2 filters to help manage your MongoDB replica sets.  For instance, we use tags like 'replicaset' with values that represent what replica set they are a part of, but they can really be any EC2 API compatible filter.  Wherever you run this script from will need access to Mongo (typically port 27017) and SSH access, and have your SSH keyfile available to it.
 
 Please be careful with this!  Run in dry run first, and maybe try some of the commands out on their own first to make sure this won't disrupt your replica sets.
 
