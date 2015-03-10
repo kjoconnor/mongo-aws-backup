@@ -1,7 +1,7 @@
 mongo-aws-backup
 ================
 
-@gooeyblob / kevino@digg.com
+@gooeyblob / kjoconnor@gmail.com
 
 Python script to discover and back up MongoDB replica sets hosted on EC2.
 
