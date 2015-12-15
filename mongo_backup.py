@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 import argparse
 import logging
 
@@ -9,7 +10,7 @@ from pymongo import MongoReplicaSetClient, MongoClient
 # Leave these blank to just use IAM roles
 AWS_ACCESS_KEY_ID = ''
 AWS_SECRET_ACCESS_KEY = ''
-AWS_REGION = 'us-east-1'
+AWS_REGION = 'us-west-2'
 
 # TODO:
 # Add rotation?
@@ -45,7 +46,7 @@ class AwsMongoBackup(object):
             self.logger = logger
 
         if region is None:
-            region = 'us-east-1'
+            region = AWS_REGION
 
         if AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY:
             self.ec2 = ec2_connect_to_region(
@@ -137,7 +138,7 @@ class AwsMongoBackup(object):
         rs_member_hosts = [z[0] for z in self.mongo.hosts]
 
         for rs_member in rs_status['members']:
-            if rs_member['name'].split(':')[0] not in rs_member_hosts:
+            if rs_member['name'].split(':')[0] not in rs_member_hosts and rs_member['stateStr'] != 'ARBITER':
                 hidden_members.append((
                     rs_member['name'].split(':')[0],
                     int(rs_member['name'].split(':')[1])
@@ -167,15 +168,17 @@ class AwsMongoBackup(object):
                 return (test_result, err_str)
             self.logger.debug("member %s passed health" % rs_member['name'])
 
-            if rs_member.get('pingMs', 0) > 10:
-                err_str = "ping time for RS member {rs_member} is larger than"\
-                    "10ms.  Please check network connectivity and try again."\
-                    .format(rs_member=rs_member['name'])
-                test_result = False
-                return (test_result, err_str)
-            self.logger.debug("member %s passed pingMs" % rs_member['name'])
+            # Arbiters don't have optimeDate and pingMs, skip checks on marbs
+            if rs_member['stateStr'] != 'ARBITER':
+                if rs_member.get('pingMs', 0) > 10:
+                    err_str = "ping time for RS member {rs_member} is larger than"\
+                        "10ms.  Please check network connectivity and try again."\
+                        .format(rs_member=rs_member['name'])
+                    test_result = False
+                    return (test_result, err_str)
+                self.logger.debug("member %s passed pingMs" % rs_member['name'])
 
-            optime_dates.append(rs_member['optimeDate'])
+                optime_dates.append(rs_member['optimeDate'])
 
         self.hidden_members = hidden_members
 
@@ -186,8 +189,8 @@ class AwsMongoBackup(object):
             return (test_result, err_str)
         self.logger.debug("passed replication lag test")
 
-        if len(self.mongo.secondaries) + len(hidden_members) < 2:
-            err_str = "There needs to be at least two secondaries or a hidden"\
+        if len(self.mongo.secondaries) + len(hidden_members) < 1:
+            err_str = "There needs to be at least one secondary or a hidden"\
                 " member available to do backups.  Please check RS integrity "\
                 "and try again."
             test_result = False
