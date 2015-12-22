@@ -5,7 +5,7 @@ import logging
 from boto.ec2 import connect_to_region as ec2_connect_to_region
 from datetime import datetime
 from paramiko import SSHClient, AutoAddPolicy
-from pymongo import MongoReplicaSetClient, MongoClient
+from pymongo import MongoClient
 
 # Leave these blank to just use IAM roles
 AWS_ACCESS_KEY_ID = ''
@@ -106,12 +106,12 @@ class AwsMongoBackup(object):
         if not hasattr(AwsMongoBackup, 'mongo') or force:
             mongo_rs_str = ','.join([x.public_dns_name for x in instances])
             self.logger.debug("connecting to mongo URI %s" % mongo_rs_str)
-            self.mongo = MongoReplicaSetClient(
+            self.mongo = MongoClient(
                 mongo_rs_str,
                 replicaSet=self.replicaset
             )
 
-            if self.mongo.alive():
+            if self.mongo.admin.command('ping'):
                 return self.mongo
             else:
                 self.mongo = None
@@ -133,13 +133,19 @@ class AwsMongoBackup(object):
         optime_dates = []
         rs_states = {}
         hidden_members = []
+        secondaries = []
 
         rs_status = self.mongo.admin.command('replSetGetStatus')
-        rs_member_hosts = [z[0] for z in self.mongo.hosts]
+        rs_member_hosts = [z[0] for z in self.mongo.nodes]
 
         for rs_member in rs_status['members']:
             if rs_member['name'].split(':')[0] not in rs_member_hosts and rs_member['stateStr'] != 'ARBITER':
                 hidden_members.append((
+                    rs_member['name'].split(':')[0],
+                    int(rs_member['name'].split(':')[1])
+                ))
+            elif rs_member['stateStr'] == 'SECONDARY':
+                secondaries.append((
                     rs_member['name'].split(':')[0],
                     int(rs_member['name'].split(':')[1])
                 ))
@@ -181,6 +187,7 @@ class AwsMongoBackup(object):
                 optime_dates.append(rs_member['optimeDate'])
 
         self.hidden_members = hidden_members
+        self.secondaries = secondaries
 
         if (max(optime_dates) - min(optime_dates)).total_seconds() > 5:
             err_str = "optimeDates is over 5 seconds, there is too much "\
@@ -189,7 +196,7 @@ class AwsMongoBackup(object):
             return (test_result, err_str)
         self.logger.debug("passed replication lag test")
 
-        if len(self.mongo.secondaries) + len(hidden_members) < 1:
+        if len(secondaries) + len(hidden_members) < 1:
             err_str = "There needs to be at least one secondary or a hidden"\
                 " member available to do backups.  Please check RS integrity "\
                 "and try again."
@@ -211,7 +218,7 @@ class AwsMongoBackup(object):
         if self.hidden_members:
             return self.hidden_members.pop()
         else:
-            return self.mongo.secondaries.pop()
+            return self.secondaries.pop()
 
     def backup(self):
         # Test that the replica set is in a good state to perform backups
