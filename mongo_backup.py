@@ -1,10 +1,28 @@
 #!/usr/bin/env python
+"""
+NAME
+    fixme
+DESCRIPTION
+    fixme
+EXAMPLES
+    ./mongo_backup.py -r MyReplicaSet --ec2-filter 'tag:mongodb,MyReplicaSet'
+
+TODO
+    Add rotation?
+    Configging out more stuff
+    Version checks
+    Finish or remove _instances_via_ids, seems like just using filters is
+        better though
+
+    Restore process:
+        fixme
+"""
+
 import argparse
 import logging
 
 from boto.ec2 import connect_to_region as ec2_connect_to_region
 from datetime import datetime
-from paramiko import SSHClient, AutoAddPolicy
 from pymongo import MongoClient
 
 # Leave these blank to just use IAM roles
@@ -12,31 +30,12 @@ AWS_ACCESS_KEY_ID = ''
 AWS_SECRET_ACCESS_KEY = ''
 AWS_REGION = 'us-west-2'
 
-# TODO:
-# Add rotation?
-# Configging out more stuff
-# Version checks
-# Finish or remove _instances_via_ids, seems like just using filters is
-#   better though
-
-# Command line:
-# python mongo_backup.py -r MyReplicaSet \
-#   --ec2-filter "tag:mongodb,MyReplicaSet" -k key.pem -u ubuntu
-
-# Restore process:
-# Create volume from snapshot
-# Attach to instance
-# Mount (and configure mongo dbpath if necessary)
-# chown mounted path to mongo:mongo
-
-
 class AwsMongoBackup(object):
 
     def __init__(self,
                  replicaset=None,
                  filters=None,
                  instance_ids=None,
-                 ssh_opts=None,
                  dryrun=False,
                  region=None,
                  logger=None):
@@ -76,9 +75,6 @@ class AwsMongoBackup(object):
         self.mongo = self._mongo(instances=self.instances)
         self.logger.debug("connected to mongo %s" % self.mongo)
 
-        self.ssh_opts = ssh_opts
-        self.logger.debug("set ssh opts to %s" % self.ssh_opts)
-
         self.dryrun = dryrun
 
     def _instances_via_filters(self, filters=None):
@@ -116,15 +112,6 @@ class AwsMongoBackup(object):
             else:
                 self.mongo = None
                 return None
-
-    def _ssh(self, hostname, ssh_opts):
-        self.ssh = SSHClient()
-        self.ssh.set_missing_host_key_policy(AutoAddPolicy())
-        self.ssh.connect(hostname=hostname, **ssh_opts)
-
-        self.logger.debug("connected via ssh to %s" % hostname)
-
-        return self.ssh
 
     def test_replicaset(self):
         test_result = True
@@ -229,21 +216,6 @@ class AwsMongoBackup(object):
         # Choose a member from which to back up
         backup_member = self.choose_member()
 
-        self._ssh(backup_member[0], self.ssh_opts)
-
-        # Get the instance ID
-        stdin, stdout, stderr = self.ssh.exec_command(
-            '/usr/bin/curl http://169.254.169.254/latest/meta-data/instance-id'
-        )
-
-        instance_id = stdout.readline().rstrip()
-        self.logger.debug("Working on instance %s" % instance_id)
-
-        reservation = self.ec2.get_all_instances(instance_ids=[instance_id, ])
-        instance = reservation[0].instances[0]
-
-        self.logger.debug("got boto ec2 instance %s" % instance)
-
         # Connect to the backup target directly
         backup_member_mongo = MongoClient(
             host=backup_member[0],
@@ -256,43 +228,6 @@ class AwsMongoBackup(object):
             # This member is hidden so we can safely take backups without
             # doing any other maintenance work
             freeze_rs = False
-
-        # Find what volume database data is on
-        cfg = backup_member_mongo.admin.command('getCmdLineOpts')
-
-        cfg_data_volume = cfg['parsed']['dbpath']
-
-        self.logger.debug("found parsed dbpath of %s" % cfg_data_volume)
-
-        stdin, stdout, stderr = self.ssh.exec_command(
-            '/usr/bin/sudo /bin/df {cfg_data_volume} | '
-            '/bin/grep -v "Filesystem"'
-            .format(cfg_data_volume=cfg_data_volume)
-        )
-
-        mount_info = stdout.readline().rstrip()
-        mount_info = mount_info.split(' ')[0]
-
-        self.logger.debug("working on mount %s" % mount_info)
-
-        # Find the matching EBS volume for this mount point
-        volumes = self.ec2.get_all_volumes(
-            filters={'attachment.instance-id': instance_id}
-        )
-
-        data_volume = None
-        for volume in volumes:
-            # There's a strange thing that happens, /dev/sdh1 can magically
-            # become /dev/xdh1 at boot time on instances.  Check for both.
-            volume_mount_point = volume.attach_data.device
-            if volume_mount_point == mount_info or \
-                    volume_mount_point.replace('sd', 'xvd') == mount_info:
-                data_volume = volume
-
-        if data_volume is None:
-            raise RuntimeError("Couldn't find EBS data volume!")
-
-        self.logger.debug("found data volume %s" % data_volume)
 
         # Remove the member from the replicaset (mark as hidden)
         if freeze_rs:
@@ -325,33 +260,12 @@ class AwsMongoBackup(object):
 
         if self.dryrun:
             self.logger.debug(
-                "Would have created snapshot of volume {volume}"
-                .format(volume=data_volume)
+                "Would have created mongodump of {backup_member}"
+                .format(backup_member=backup_member)
             )
-            self.current_snapshot = None
         else:
-            self.logger.debug("creating snapshot of %s" % data_volume)
-            snapshot = data_volume.create_snapshot(
-                description="mongobackup {date} {replicaset}".format(
-                    date=self.creation_time,
-                    replicaset=self.replicaset)
-            )
-
-            self.current_snapshot = snapshot.id
-
-            tags = {
-                'replicaset': self.replicaset,
-                'sourcehost': backup_member[0],
-                'creation_time': self.creation_time
-            }
-            self.logger.debug(
-                "adding tags %s to snapshot %s" % (tags, snapshot)
-            )
-
-            self.ec2.create_tags(
-                resource_ids=[snapshot.id, ],
-                tags=tags
-            )
+            # `mongodump` goes here
+            print
 
         # Unlock mongo
         if self.dryrun:
@@ -366,7 +280,6 @@ class AwsMongoBackup(object):
                 .format(backup_member=backup_member)
             )
             backup_member_mongo.unlock()
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -387,22 +300,6 @@ if __name__ == '__main__':
              "tag 'replicaset' and a value of 'importantthings'.  Multiple "
              "filters can be separated with a semicolon.",
         dest="ec2filter",
-        required=True
-    )
-    parser.add_argument(
-        "-k",
-        "--ssh-keyfile",
-        action="store",
-        help="Path to SSH key file to use.",
-        dest="sshkeyfile",
-        required=True
-    )
-    parser.add_argument(
-        "-u",
-        "--user",
-        action="store",
-        help="Username to use to connect over SSH.",
-        dest="sshuser",
         required=True
     )
     parser.add_argument(
@@ -439,10 +336,6 @@ if __name__ == '__main__':
     mb = AwsMongoBackup(
         replicaset=args.replicaset,
         filters=ec2filter,
-        ssh_opts={
-            'key_filename': args.sshkeyfile,
-            'username': args.sshuser
-        },
         dryrun=args.dryrun,
         logger=logger
     )
