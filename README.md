@@ -1,6 +1,8 @@
 mongo-aws-backup
 ================
 
+[![ghit.me](https://ghit.me/badge.svg?repo=kjoconnor/mongo-aws-backup)](https://ghit.me/repo/kjoconnor/mongo-aws-backup)
+
 @gooeyblob / kjoconnor@gmail.com
 
 Python script to discover and back up MongoDB replica sets hosted on EC2.
