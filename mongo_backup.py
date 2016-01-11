@@ -1,18 +1,14 @@
 #!/usr/bin/env python
 """
 NAME
-    fixme
+    mongo_backup.py - Backup all MongoDB databases on a replica set
 DESCRIPTION
     fixme
 EXAMPLES
     ./mongo_backup.py -r MyReplicaSet --ec2-filter 'tag:mongodb,MyReplicaSet'
 
 TODO
-    Add rotation?
-    Configging out more stuff
-    Version checks
-    Finish or remove _instances_via_ids, seems like just using filters is
-        better though
+    Check if `mongodump` is installed before anything
 
     Restore process:
         fixme
@@ -20,6 +16,7 @@ TODO
 
 import argparse
 import logging
+import subprocess
 
 from boto.ec2 import connect_to_region as ec2_connect_to_region
 from datetime import datetime
@@ -35,7 +32,6 @@ class AwsMongoBackup(object):
     def __init__(self,
                  replicaset=None,
                  filters=None,
-                 instance_ids=None,
                  dryrun=False,
                  region=None,
                  logger=None):
@@ -65,11 +61,8 @@ class AwsMongoBackup(object):
 
         if filters:
             self.instances = self._instances_via_filters(filters=filters)
-        elif instance_ids:
-            self.instances = self._instances_via_ids(instance_ids=instance_ids)
         else:
-            raise RuntimeError('Either an API filter or a list of instance'
-                               'IDs must be provided.')
+            raise RuntimeError('An API filter must be provided.')
         self.logger.debug("found instances %s" % self.instances)
 
         self.mongo = self._mongo(instances=self.instances)
@@ -91,12 +84,6 @@ class AwsMongoBackup(object):
             instances.extend(reservation.instances)
 
         return instances
-
-    def _instances_via_ids(self, instance_ids=None):
-        if instance_ids is None or type(instance_ids) is not 'list':
-            raise ValueError('instances must be provided in a list')
-
-        raise NotImplementedError("I'll come back to this later.")
 
     def _mongo(self, instances, force=False):
         if not hasattr(AwsMongoBackup, 'mongo') or force:
@@ -126,7 +113,8 @@ class AwsMongoBackup(object):
         rs_member_hosts = [z[0] for z in self.mongo.nodes]
 
         for rs_member in rs_status['members']:
-            if rs_member['name'].split(':')[0] not in rs_member_hosts and rs_member['stateStr'] != 'ARBITER':
+            if rs_member['name'].split(':')[0] not in rs_member_hosts and \
+               rs_member['stateStr'] != 'ARBITER':
                 hidden_members.append((
                     rs_member['name'].split(':')[0],
                     int(rs_member['name'].split(':')[1])
@@ -164,12 +152,13 @@ class AwsMongoBackup(object):
             # Arbiters don't have optimeDate and pingMs, skip checks on marbs
             if rs_member['stateStr'] != 'ARBITER':
                 if rs_member.get('pingMs', 0) > 10:
-                    err_str = "ping time for RS member {rs_member} is larger than"\
-                        "10ms.  Please check network connectivity and try again."\
-                        .format(rs_member=rs_member['name'])
+                    err_str = "ping time for RS member {rs_member} is larger "\
+                        "than 10ms. Please check network connectivity and try"\
+                        " again.".format(rs_member=rs_member['name'])
                     test_result = False
                     return (test_result, err_str)
-                self.logger.debug("member %s passed pingMs" % rs_member['name'])
+                self.logger.debug("member %s passed pingMs"
+                    % rs_member['name'])
 
                 optime_dates.append(rs_member['optimeDate'])
 
@@ -185,7 +174,7 @@ class AwsMongoBackup(object):
 
         if len(secondaries) + len(hidden_members) < 1:
             err_str = "There needs to be at least one secondary or a hidden"\
-                " member available to do backups.  Please check RS integrity "\
+                " member available to do backups. Please check RS integrity "\
                 "and try again."
             test_result = False
             return (test_result, err_str)
@@ -194,7 +183,7 @@ class AwsMongoBackup(object):
 
         if rs_states[1] != 1:
             err_str = "There needs to be one and exactly one mongo primary to"\
-                " do backups.  Please check RS integrity and try again."
+                " do backups. Please check RS integrity and try again."
             test_result = False
             return (test_result, err_str)
         self.logger.debug("passed primary mongo test")
@@ -260,12 +249,23 @@ class AwsMongoBackup(object):
 
         if self.dryrun:
             self.logger.debug(
-                "Would have created mongodump of {backup_member}"
+                "Would have dumped databases on {backup_member}"
                 .format(backup_member=backup_member)
             )
         else:
-            # `mongodump` goes here
-            print
+            self.logger.debug(
+                "dumping databases on {backup_member}"
+                .format(backup_member=backup_member)
+            )
+            for database in backup_member_mongo.database_names():
+                if database != 'local':
+                    mongodump = 'mongodump -h {backup_member} -d {database} '\
+                                '-o {backup_member}'.format(
+                                    backup_member=backup_member[0],
+                                    database=database
+                                )
+                    mongodump = mongodump.split(' ')
+                    subprocess.check_output(mongodump)
 
         # Unlock mongo
         if self.dryrun:
@@ -297,7 +297,7 @@ if __name__ == '__main__':
         action="store",
         help="EC2 API compatible filter with which to find instances, ex. "
              "'tag:replicaset,importantthings' will find instances with the "
-             "tag 'replicaset' and a value of 'importantthings'.  Multiple "
+             "tag 'replicaset' and a value of 'importantthings'. Multiple "
              "filters can be separated with a semicolon.",
         dest="ec2filter",
         required=True
