@@ -8,24 +8,31 @@ EXAMPLES
     ./mongo_backup.py -r MyReplicaSet --ec2-filter 'tag:mongodb,MyReplicaSet'
 
 TODO
-    Check if `mongodump` is installed before anything
-
-    Restore process:
-        fixme
+    - Check if `mongodump` is installed before anything
+    - Revisit params
+    - Better logging messages
+    - Document restore process
 """
 
 import argparse
 import logging
 import subprocess
+import tarfile
 
 from boto.ec2 import connect_to_region as ec2_connect_to_region
+from boto.s3 import connect_to_region as s3_connect_to_region, key
 from datetime import datetime
+from os import listdir
 from pymongo import MongoClient
 
 # Leave these blank to just use IAM roles
 AWS_ACCESS_KEY_ID = ''
 AWS_SECRET_ACCESS_KEY = ''
 AWS_REGION = 'us-west-2'
+# S3 settings
+s3_bucket_name = '2tor-backups'
+s3_bucket_dest_dir = 'MongoDB_backups_us-east-1'
+s3_bucket_region = 'us-east-1'
 
 class AwsMongoBackup(object):
 
@@ -35,7 +42,7 @@ class AwsMongoBackup(object):
                  dryrun=False,
                  region=None,
                  logger=None):
-        self.creation_time = datetime.utcnow().strftime("%m-%d-%Y %H:%M:%S")
+        self.creation_time = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 
         if logger is not None:
             self.logger = logger
@@ -49,13 +56,21 @@ class AwsMongoBackup(object):
                 aws_access_key_id=AWS_ACCESS_KEY_ID,
                 aws_secret_access_key=AWS_SECRET_ACCESS_KEY
             )
+            self.s3 = s3_connect_to_region(
+                s3_bucket_region,
+                aws_access_key_id=AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+            )
         else:
             self.ec2 = ec2_connect_to_region(
                 region
             )
+            self.s3 = s3_connect_to_region(
+               s3_bucket_region
+            )
 
         if replicaset is None:
-            raise RuntimeError('replicaset must be provided.')
+            raise RuntimeError('Replicaset must be provided.')
 
         self.replicaset = replicaset
 
@@ -63,16 +78,16 @@ class AwsMongoBackup(object):
             self.instances = self._instances_via_filters(filters=filters)
         else:
             raise RuntimeError('An API filter must be provided.')
-        self.logger.debug("found instances %s" % self.instances)
+        self.logger.debug("Found instances %s" % self.instances)
 
         self.mongo = self._mongo(instances=self.instances)
-        self.logger.debug("connected to mongo %s" % self.mongo)
+        self.logger.debug("Connected to mongo %s" % self.mongo)
 
         self.dryrun = dryrun
 
     def _instances_via_filters(self, filters=None):
         if filters is None:
-            raise ValueError('filters must be a dict of valid EC2 API filters')
+            raise ValueError('Filters must be a dict of valid EC2 API filters')
 
         reservations = self.ec2.get_all_instances(
             filters=filters
@@ -88,7 +103,7 @@ class AwsMongoBackup(object):
     def _mongo(self, instances, force=False):
         if not hasattr(AwsMongoBackup, 'mongo') or force:
             mongo_rs_str = ','.join([x.public_dns_name for x in instances])
-            self.logger.debug("connecting to mongo URI %s" % mongo_rs_str)
+            self.logger.debug("Connecting to mongo URI %s" % mongo_rs_str)
             self.mongo = MongoClient(
                 mongo_rs_str,
                 replicaSet=self.replicaset
@@ -139,7 +154,7 @@ class AwsMongoBackup(object):
                     )
                 test_result = False
                 return (test_result, err_str)
-            self.logger.debug("member %s passed state" % rs_member['name'])
+            self.logger.debug("Member %s passed state" % rs_member['name'])
 
             if rs_member.get('health', 1) != 1:
                 err_str = "RS member {rs_member} is marked as unhealthy, "\
@@ -147,17 +162,17 @@ class AwsMongoBackup(object):
                     .format(rs_member=rs_member['name'])
                 test_result = False
                 return (test_result, err_str)
-            self.logger.debug("member %s passed health" % rs_member['name'])
+            self.logger.debug("Member %s passed health" % rs_member['name'])
 
             # Arbiters don't have optimeDate and pingMs, skip checks on marbs
             if rs_member['stateStr'] != 'ARBITER':
                 if rs_member.get('pingMs', 0) > 10:
-                    err_str = "ping time for RS member {rs_member} is larger "\
+                    err_str = "Ping time for RS member {rs_member} is larger "\
                         "than 10ms. Please check network connectivity and try"\
                         " again.".format(rs_member=rs_member['name'])
                     test_result = False
                     return (test_result, err_str)
-                self.logger.debug("member %s passed pingMs"
+                self.logger.debug("Member %s passed pingMs"
                     % rs_member['name'])
 
                 optime_dates.append(rs_member['optimeDate'])
@@ -166,11 +181,11 @@ class AwsMongoBackup(object):
         self.secondaries = secondaries
 
         if (max(optime_dates) - min(optime_dates)).total_seconds() > 5:
-            err_str = "optimeDates is over 5 seconds, there is too much "\
+            err_str = "OptimeDate is over 5 seconds, there is too much "\
                 "replication lag to continue."
             test_result = False
             return (test_result, err_str)
-        self.logger.debug("passed replication lag test")
+        self.logger.debug("Passed replication lag test")
 
         if len(secondaries) + len(hidden_members) < 1:
             err_str = "There needs to be at least one secondary or a hidden"\
@@ -179,14 +194,14 @@ class AwsMongoBackup(object):
             test_result = False
             return (test_result, err_str)
 
-        self.logger.debug("mongo secondaries test passed")
+        self.logger.debug("Mongo secondaries test passed")
 
         if rs_states[1] != 1:
             err_str = "There needs to be one and exactly one mongo primary to"\
                 " do backups. Please check RS integrity and try again."
             test_result = False
             return (test_result, err_str)
-        self.logger.debug("passed primary mongo test")
+        self.logger.debug("Passed primary mongo test")
 
         return (test_result, err_str)
 
@@ -210,7 +225,7 @@ class AwsMongoBackup(object):
             host=backup_member[0],
             port=backup_member[1]
         )
-        self.logger.debug("connected to mongo target %s" % backup_member_mongo)
+        self.logger.debug("Connected to mongo target %s" % backup_member_mongo)
 
         freeze_rs = True
         if backup_member_mongo.admin.command('isMaster').get('hidden', False):
@@ -218,19 +233,19 @@ class AwsMongoBackup(object):
             # doing any other maintenance work
             freeze_rs = False
 
-        # Remove the member from the replicaset (mark as hidden)
+        # Remove the member from the replica set (mark as hidden)
         if freeze_rs:
             # Can probably use replSetMaintenance here but not available
             # in my testing version
             if self.dryrun:
-                self.logger.debug("Would have frozen replicaset")
+                self.logger.debug("Would have frozen replica set")
             else:
-                self.logger.debug('Freezing replicaset')
+                self.logger.debug('Freezing replica set')
                 backup_member_mongo.admin.command({'replSetFreeze': 86400})
 
         else:
             self.logger.debug(
-                "skipping replicaset freeze, %s is a hidden member"
+                "Skipping replica set freeze, %s is a hidden member"
                 % backup_member[0]
             )
 
@@ -242,7 +257,7 @@ class AwsMongoBackup(object):
             )
         else:
             self.logger.debug(
-                "fsync/locking {backup_member}"
+                "Fsync/locking {backup_member}"
                 .format(backup_member=backup_member)
             )
             backup_member_mongo.fsync(lock=True)
@@ -254,7 +269,7 @@ class AwsMongoBackup(object):
             )
         else:
             self.logger.debug(
-                "dumping databases on {backup_member}"
+                "Dumping databases on {backup_member}"
                 .format(backup_member=backup_member)
             )
             for database in backup_member_mongo.database_names():
@@ -272,14 +287,30 @@ class AwsMongoBackup(object):
             self.logger.debug("Would have unlocked mongo")
         else:
             if freeze_rs:
-                self.logger.debug('unfreezing replicaset')
+                self.logger.debug('Unfreezing replica set')
                 backup_member_mongo.admin.command({'replSetFreeze': 0})
 
             self.logger.debug(
-                "unlocking {backup_member}"
+                "Unlocking {backup_member}"
                 .format(backup_member=backup_member)
             )
             backup_member_mongo.unlock()
+
+        # Archive and upload to S3
+        if self.dryrun:
+            self.logger.debug("Would have archived dumps and uploaded to S3")
+        else:
+            self.logger.debug("Archiving dumps and uploading to S3")
+            dumps = listdir(backup_member[0])
+            for dump in dumps:
+                archive_path = backup_member[0] + '/' + dump
+                archive_name = dump + '_' + self.creation_time + '.tar.gz'
+                with tarfile.open(archive_name, 'w:gz') as tar:
+                    tar.add(archive_path, arcname=dump)
+                bucket = self.s3.get_bucket(s3_bucket_name)
+                key_obj = key.Key(bucket)
+                key_obj.key = s3_bucket_dest_dir + '/' + archive_name
+                key_obj.set_contents_from_filename(archive_name)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -317,7 +348,7 @@ if __name__ == '__main__':
     ch.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        '%(asctime)s - %(levelname)s - %(message)s'
     )
 
     ch.setFormatter(formatter)
@@ -326,7 +357,7 @@ if __name__ == '__main__':
     ec2filter = {}
 
     if ',' not in args.ec2filter:
-        raise RuntimeError("ec2filter provided is invalid")
+        raise RuntimeError("EC2 filter provided is invalid")
 
     for x in args.ec2filter.split(';'):
         ec2filter.update(
