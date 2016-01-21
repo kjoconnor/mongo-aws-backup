@@ -273,7 +273,7 @@ class AwsMongoBackup(object):
                 .format(backup_member=backup_member)
             )
             for database in backup_member_mongo.database_names():
-                if database != 'local':
+                if database not in args.exclude_dbs:
                     mongodump = 'mongodump -h {backup_member} -d {database} '\
                                 '-o {backup_member}'.format(
                                     backup_member=backup_member[0],
@@ -318,14 +318,12 @@ if __name__ == '__main__':
     parser.add_argument(
         "-r",
         "--replicaset",
-        action="store",
         help="Replica set to back up.",
         dest="replicaset",
         required=True
     )
     parser.add_argument(
         "--ec2-filter",
-        action="store",
         help="EC2 API compatible filter with which to find instances, ex. "
              "'tag:replicaset,importantthings' will find instances with the "
              "tag 'replicaset' and a value of 'importantthings'. Multiple "
@@ -334,10 +332,18 @@ if __name__ == '__main__':
         required=True
     )
     parser.add_argument(
+        "--exclude-dbs",
+        help="Names of databases to exclude when dumping, e.g. 'local'. "
+             "Separate multiple values by space, e.g. 'admin local'",
+        dest="exclude_dbs",
+        nargs='*',
+        default=[],
+    )
+    parser.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
-        help="Don't actually do anything, just print what we would have done",
+        help="Don't actually do anything, just print what we would have done.",
         dest="dryrun"
     )
     args = parser.parse_args()
