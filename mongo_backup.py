@@ -180,12 +180,14 @@ class AwsMongoBackup(object):
         self.hidden_members = hidden_members
         self.secondaries = secondaries
 
-        if (max(optime_dates) - min(optime_dates)).total_seconds() > 5:
-            err_str = "OptimeDate is over 5 seconds, there is too much "\
-                "replication lag to continue."
+        replication_lag=(max(optime_dates) - min(optime_dates)).total_seconds()
+        if replication_lag > 59:
+            err_str = "There's a {replication_lag} seconds replication lag, "\
+                "too much to continue.".format(replication_lag=replication_lag)
             test_result = False
             return (test_result, err_str)
-        self.logger.debug("Passed replication lag test")
+        self.logger.debug("Passed replication lag test: {replication_lag} "\
+            "seconds".format(replication_lag=replication_lag))
 
         if len(secondaries) + len(hidden_members) < 1:
             err_str = "There needs to be at least one secondary or a hidden"\
