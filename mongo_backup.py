@@ -9,6 +9,7 @@ EXAMPLES
 
 TODO
     - Check if `mongodump` is installed before anything
+    - Verify `mongodump` command exit code
     - Revisit params
     - Better logging messages
     - Document restore process
@@ -33,6 +34,7 @@ AWS_REGION = 'us-west-2'
 s3_bucket_name = '2tor-backups'
 s3_bucket_dest_dir = 'MongoDB_backups_us-east-1'
 s3_bucket_region = 'us-east-1'
+
 
 class AwsMongoBackup(object):
 
@@ -173,21 +175,22 @@ class AwsMongoBackup(object):
                     test_result = False
                     return (test_result, err_str)
                 self.logger.debug("Member %s passed pingMs"
-                    % rs_member['name'])
+                                  % rs_member['name'])
 
                 optime_dates.append(rs_member['optimeDate'])
 
         self.hidden_members = hidden_members
         self.secondaries = secondaries
 
-        replication_lag=(max(optime_dates) - min(optime_dates)).total_seconds()
+        replication_lag = (max(optime_dates) -
+                           min(optime_dates)).total_seconds()
         if replication_lag > 59:
             err_str = "There's a {replication_lag} seconds replication lag, "\
                 "too much to continue.".format(replication_lag=replication_lag)
             test_result = False
             return (test_result, err_str)
-        self.logger.debug("Passed replication lag test: {replication_lag} "\
-            "seconds".format(replication_lag=replication_lag))
+        self.logger.debug("Passed replication lag test: {replication_lag} "
+                          "seconds".format(replication_lag=replication_lag))
 
         if len(secondaries) + len(hidden_members) < 1:
             err_str = "There needs to be at least one secondary or a hidden"\
@@ -277,12 +280,13 @@ class AwsMongoBackup(object):
             for database in backup_member_mongo.database_names():
                 if database not in args.exclude_dbs:
                     mongodump = 'mongodump -h {backup_member} -d {database} '\
-                                '-o {backup_member}'.format(
+                                '-o {backup_member} --quiet'.format(
                                     backup_member=backup_member[0],
                                     database=database
                                 )
                     mongodump = mongodump.split(' ')
-                    subprocess.check_output(mongodump)
+                    subprocess.check_output(mongodump,
+                                            stderr=subprocess.STDOUT)
 
         # Unlock mongo
         if self.dryrun:
