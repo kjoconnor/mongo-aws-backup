@@ -254,19 +254,6 @@ class AwsMongoBackup(object):
                 % backup_member[0]
             )
 
-        # Fsynclock mongo
-        if self.dryrun:
-            self.logger.debug(
-                "Would have fsynclocked {backup_member}"
-                .format(backup_member=backup_member)
-            )
-        else:
-            self.logger.debug(
-                "Fsync/locking {backup_member}"
-                .format(backup_member=backup_member)
-            )
-            backup_member_mongo.fsync(lock=True)
-
         if self.dryrun:
             self.logger.debug(
                 "Would have dumped databases on {backup_member}"
@@ -295,12 +282,6 @@ class AwsMongoBackup(object):
             if freeze_rs:
                 self.logger.debug('Unfreezing replica set')
                 backup_member_mongo.admin.command({'replSetFreeze': 0})
-
-            self.logger.debug(
-                "Unlocking {backup_member}"
-                .format(backup_member=backup_member)
-            )
-            backup_member_mongo.unlock()
 
         # Archive and upload to S3
         if self.dryrun:
