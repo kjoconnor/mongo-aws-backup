@@ -149,8 +149,7 @@ class AwsMongoBackup(object):
             if rs_member['state'] not in [1, 2, 7]:
                 # primary, secondary, arbiter
                 err_str = "RS member {rs_member} has a state of {state}, "\
-                    "please check RS integrity and try again."\
-                    .format(
+                    "please check RS integrity and try again.".format(
                         rs_member=rs_member['name'],
                         state=rs_member['stateStr']
                     )
@@ -160,18 +159,23 @@ class AwsMongoBackup(object):
 
             if rs_member.get('health', 1) != 1:
                 err_str = "RS member {rs_member} is marked as unhealthy, "\
-                    "please check RS integrity and try again."\
-                    .format(rs_member=rs_member['name'])
+                    "please check RS integrity and try again.".format(
+                        rs_member=rs_member['name']
+                    )
                 test_result = False
                 return (test_result, err_str)
             self.logger.debug("Member %s passed health" % rs_member['name'])
 
             # Arbiters don't have optimeDate and pingMs, skip checks on marbs
             if rs_member['stateStr'] != 'ARBITER':
-                if rs_member.get('pingMs', 0) > 10:
-                    err_str = "Ping time for RS member {rs_member} is larger "\
-                        "than 10ms. Please check network connectivity and try"\
-                        " again.".format(rs_member=rs_member['name'])
+                pingMs = rs_member.get('pingMs', 0)
+                if pingMs > 15:
+                    err_str = "Ping time for RS member {rs_member} is "\
+                        "{pingMs}. Please check network connectivity and try "\
+                        "again.".format(
+                            rs_member=rs_member['name'],
+                            pingMs=pingMs
+                         )
                     test_result = False
                     return (test_result, err_str)
                 self.logger.debug("Member %s passed pingMs"
