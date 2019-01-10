@@ -104,7 +104,7 @@ class AwsMongoBackup(object):
 
     def _mongo(self, instances, force=False):
         if not hasattr(AwsMongoBackup, 'mongo') or force:
-            mongo_rs_str = ','.join([x.public_dns_name for x in instances])
+            mongo_rs_str = ','.join([x.private_dns_name for x in instances])
             self.logger.debug("Connecting to mongo URI %s" % mongo_rs_str)
             self.mongo = MongoClient(
                 mongo_rs_str,
