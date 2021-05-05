@@ -19,9 +19,12 @@ import argparse
 import logging
 import subprocess
 import tarfile
+import boto3
+import json
 
 from boto.ec2 import connect_to_region as ec2_connect_to_region
 from boto.s3 import connect_to_region as s3_connect_to_region, key
+from botocore.exceptions import ClientError
 from datetime import datetime
 from os import listdir
 from pymongo import MongoClient
@@ -34,6 +37,9 @@ AWS_REGION = 'us-west-2'
 s3_bucket_name = '2tor-backups'
 s3_bucket_dest_dir = 'MongoDB_backups_us-east-1'
 s3_bucket_region = 'us-east-1'
+# Secrets Manager Settings
+secret_path_tag = 'mdb_secret_id'
+secret_key = 'ADMIN_MONGO_DB_PASSWORD'
 
 
 class AwsMongoBackup(object):
@@ -45,6 +51,7 @@ class AwsMongoBackup(object):
                  region=None,
                  logger=None):
         self.creation_time = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+        self.secret = ''
 
         if logger is not None:
             self.logger = logger
@@ -68,7 +75,7 @@ class AwsMongoBackup(object):
                 region
             )
             self.s3 = s3_connect_to_region(
-               s3_bucket_region
+                s3_bucket_region
             )
 
         if replicaset is None:
@@ -102,10 +109,47 @@ class AwsMongoBackup(object):
 
         return instances
 
+    def _get_secret(self, secret_id):
+
+        session = boto3.session.Session()
+        client = session.client(
+            service_name='secretsmanager',
+            region_name=AWS_REGION,
+        )
+
+        try:
+            response = client.get_secret_value(
+                SecretId=secret_id
+            )
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ResourceNotFoundException':
+                print("The requested secret " + secret_id + " was not found")
+            elif e.response['Error']['Code'] == 'InvalidRequestException':
+                print("The request was invalid due to:", e)
+            elif e.response['Error']['Code'] == 'InvalidParameterException':
+                print("The request had invalid params:", e)
+            elif e.response['Error']['Code'] == 'DecryptionFailure':
+                print(
+                    "The requested secret can't be decrypted using the provided KMS key:", e)
+            elif e.response['Error']['Code'] == 'InternalServiceError':
+                print("An error occurred on service side:", e)
+        else:
+            return json.loads(response['SecretString']).get(secret_key)
+
     def _mongo(self, instances, force=False):
         if not hasattr(AwsMongoBackup, 'mongo') or force:
-            mongo_rs_str = ','.join([x.private_dns_name for x in instances])
-            self.logger.debug("Connecting to mongo URI %s" % mongo_rs_str)
+            non_auth_mongo_rs_str = ','.join(
+                [x.private_dns_name for x in instances])
+            tags = instances[0].tags
+            if secret_path_tag in tags:
+                print("Getting secret.")
+                self.secret = self._get_secret(tags.get(secret_path_tag))
+                mongo_rs_str = 'mongodb://admin:{pw}@{hosts}:27017'.format(
+                    pw=self.secret, hosts=non_auth_mongo_rs_str)
+            else:
+                mongo_rs_str = non_auth_mongo_rs_str
+            self.logger.debug("Connecting to mongo URI %s" %
+                              non_auth_mongo_rs_str)
             self.mongo = MongoClient(
                 mongo_rs_str,
                 replicaSet=self.replicaset
@@ -175,7 +219,7 @@ class AwsMongoBackup(object):
                         "again.".format(
                             rs_member=rs_member['name'],
                             pingMs=pingMs
-                         )
+                        )
                     test_result = False
                     return (test_result, err_str)
                 self.logger.debug("Member %s passed pingMs"
@@ -229,9 +273,15 @@ class AwsMongoBackup(object):
         # Choose a member from which to back up
         backup_member = self.choose_member()
 
+        if self.secret:
+            host = 'mongodb://admin:{pw}@{host}:27017'.format(
+                pw=self.secret, host=backup_member[0]),
+        else:
+            host = backup_member[0]
+
         # Connect to the backup target directly
         backup_member_mongo = MongoClient(
-            host=backup_member[0],
+            host=host,
             port=backup_member[1]
         )
         self.logger.debug("Connected to mongo target %s" % backup_member_mongo)
@@ -275,6 +325,9 @@ class AwsMongoBackup(object):
                                     backup_member=backup_member[0],
                                     database=database
                                 )
+                    if self.secret:
+                        mongodump = '{m} -u admin -p {s} --authenticationDatabase=admin'.format(
+                            m=mongodump, s=self.secret)
                     mongodump = mongodump.split(' ')
                     subprocess.check_output(mongodump,
                                             stderr=subprocess.STDOUT)
@@ -302,6 +355,7 @@ class AwsMongoBackup(object):
                 key_obj = key.Key(bucket)
                 key_obj.key = s3_bucket_dest_dir + '/' + archive_name
                 key_obj.set_contents_from_filename(archive_name)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
