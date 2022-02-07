@@ -1,0 +1,4 @@
+{
+	"python.pythonPath": "/Users/cdunda/.pyenv/versions/2.7.17/envs/mongo-aws-backup/bin/python",
+	"python.formatting.provider": "autopep8"
+}

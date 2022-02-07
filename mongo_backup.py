@@ -1,32 +1,45 @@
+#!/usr/bin/env python
+"""
+NAME
+    mongo_backup.py - Backup all MongoDB databases on a replica set
+DESCRIPTION
+    fixme
+EXAMPLES
+    ./mongo_backup.py -r MyReplicaSet --ec2-filter 'tag:mongodb,MyReplicaSet'
+
+TODO
+    - Check if `mongodump` is installed before anything
+    - Verify `mongodump` command exit code
+    - Revisit params
+    - Better logging messages
+    - Document restore process
+"""
+
 import argparse
 import logging
+import subprocess
+import tarfile
+import boto3
+import json
 
 from boto.ec2 import connect_to_region as ec2_connect_to_region
+from boto.s3 import connect_to_region as s3_connect_to_region, key
+from botocore.exceptions import ClientError
 from datetime import datetime
-from paramiko import SSHClient, AutoAddPolicy
-from pymongo import MongoReplicaSetClient, MongoClient
+from os import listdir
+from pymongo import MongoClient
 
 # Leave these blank to just use IAM roles
 AWS_ACCESS_KEY_ID = ''
 AWS_SECRET_ACCESS_KEY = ''
-AWS_REGION = 'us-east-1'
-
-# TODO:
-# Add rotation?
-# Configging out more stuff
-# Version checks
-# Finish or remove _instances_via_ids, seems like just using filters is
-#   better though
-
-# Command line:
-# python mongo_backup.py -r MyReplicaSet \
-#   --ec2-filter "tag:mongodb,MyReplicaSet" -k key.pem -u ubuntu
-
-# Restore process:
-# Create volume from snapshot
-# Attach to instance
-# Mount (and configure mongo dbpath if necessary)
-# chown mounted path to mongo:mongo
+AWS_REGION = 'us-west-2'
+# S3 settings
+s3_bucket_name = '2tor-backups'
+s3_bucket_dest_dir = 'MongoDB_backups_us-east-1'
+s3_bucket_region = 'us-east-1'
+# Secrets Manager Settings
+secret_path_tag = 'mdb_secret_id'
+secret_key = 'ADMIN_MONGO_DB_PASSWORD'
 
 
 class AwsMongoBackup(object):
@@ -34,18 +47,17 @@ class AwsMongoBackup(object):
     def __init__(self,
                  replicaset=None,
                  filters=None,
-                 instance_ids=None,
-                 ssh_opts=None,
                  dryrun=False,
                  region=None,
                  logger=None):
-        self.creation_time = datetime.utcnow().strftime("%m-%d-%Y %H:%M:%S")
+        self.creation_time = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+        self.secret = ''
 
         if logger is not None:
             self.logger = logger
 
         if region is None:
-            region = 'us-east-1'
+            region = AWS_REGION
 
         if AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY:
             self.ec2 = ec2_connect_to_region(
@@ -53,36 +65,38 @@ class AwsMongoBackup(object):
                 aws_access_key_id=AWS_ACCESS_KEY_ID,
                 aws_secret_access_key=AWS_SECRET_ACCESS_KEY
             )
+            self.s3 = s3_connect_to_region(
+                s3_bucket_region,
+                aws_access_key_id=AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+            )
         else:
             self.ec2 = ec2_connect_to_region(
                 region
             )
+            self.s3 = s3_connect_to_region(
+                s3_bucket_region
+            )
 
         if replicaset is None:
-            raise RuntimeError('replicaset must be provided.')
+            raise RuntimeError('Replicaset must be provided.')
 
         self.replicaset = replicaset
 
         if filters:
             self.instances = self._instances_via_filters(filters=filters)
-        elif instance_ids:
-            self.instances = self._instances_via_ids(instance_ids=instance_ids)
         else:
-            raise RuntimeError('Either an API filter or a list of instance'
-                               'IDs must be provided.')
-        self.logger.debug("found instances %s" % self.instances)
+            raise RuntimeError('An API filter must be provided.')
+        self.logger.debug("Found instances %s" % self.instances)
 
         self.mongo = self._mongo(instances=self.instances)
-        self.logger.debug("connected to mongo %s" % self.mongo)
-
-        self.ssh_opts = ssh_opts
-        self.logger.debug("set ssh opts to %s" % self.ssh_opts)
+        self.logger.debug("Connected to mongo %s" % self.mongo)
 
         self.dryrun = dryrun
 
     def _instances_via_filters(self, filters=None):
         if filters is None:
-            raise ValueError('filters must be a dict of valid EC2 API filters')
+            raise ValueError('Filters must be a dict of valid EC2 API filters')
 
         reservations = self.ec2.get_all_instances(
             filters=filters
@@ -95,35 +109,57 @@ class AwsMongoBackup(object):
 
         return instances
 
-    def _instances_via_ids(self, instance_ids=None):
-        if instance_ids is None or type(instance_ids) is not 'list':
-            raise ValueError('instances must be provided in a list')
+    def _get_secret(self, secret_id):
 
-        raise NotImplementedError("I'll come back to this later.")
+        session = boto3.session.Session()
+        client = session.client(
+            service_name='secretsmanager',
+            region_name=AWS_REGION,
+        )
+
+        try:
+            response = client.get_secret_value(
+                SecretId=secret_id
+            )
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ResourceNotFoundException':
+                print("The requested secret " + secret_id + " was not found")
+            elif e.response['Error']['Code'] == 'InvalidRequestException':
+                print("The request was invalid due to:", e)
+            elif e.response['Error']['Code'] == 'InvalidParameterException':
+                print("The request had invalid params:", e)
+            elif e.response['Error']['Code'] == 'DecryptionFailure':
+                print(
+                    "The requested secret can't be decrypted using the provided KMS key:", e)
+            elif e.response['Error']['Code'] == 'InternalServiceError':
+                print("An error occurred on service side:", e)
+        else:
+            return json.loads(response['SecretString']).get(secret_key)
 
     def _mongo(self, instances, force=False):
         if not hasattr(AwsMongoBackup, 'mongo') or force:
-            mongo_rs_str = ','.join([x.public_dns_name for x in instances])
-            self.logger.debug("connecting to mongo URI %s" % mongo_rs_str)
-            self.mongo = MongoReplicaSetClient(
+            non_auth_mongo_rs_str = ','.join(
+                [x.private_dns_name for x in instances])
+            tags = instances[0].tags
+            if secret_path_tag in tags:
+                print("Getting secret.")
+                self.secret = self._get_secret(tags.get(secret_path_tag))
+                mongo_rs_str = 'mongodb://admin:{pw}@{hosts}:27017'.format(
+                    pw=self.secret, hosts=non_auth_mongo_rs_str)
+            else:
+                mongo_rs_str = non_auth_mongo_rs_str
+            self.logger.debug("Connecting to mongo URI %s" %
+                              non_auth_mongo_rs_str)
+            self.mongo = MongoClient(
                 mongo_rs_str,
                 replicaSet=self.replicaset
             )
 
-            if self.mongo.alive():
+            if self.mongo.admin.command('ping'):
                 return self.mongo
             else:
                 self.mongo = None
                 return None
-
-    def _ssh(self, hostname, ssh_opts):
-        self.ssh = SSHClient()
-        self.ssh.set_missing_host_key_policy(AutoAddPolicy())
-        self.ssh.connect(hostname=hostname, **ssh_opts)
-
-        self.logger.debug("connected via ssh to %s" % hostname)
-
-        return self.ssh
 
     def test_replicaset(self):
         test_result = True
@@ -132,13 +168,20 @@ class AwsMongoBackup(object):
         optime_dates = []
         rs_states = {}
         hidden_members = []
+        secondaries = []
 
         rs_status = self.mongo.admin.command('replSetGetStatus')
-        rs_member_hosts = [z[0] for z in self.mongo.hosts]
+        rs_member_hosts = [z[0] for z in self.mongo.nodes]
 
         for rs_member in rs_status['members']:
-            if rs_member['name'].split(':')[0] not in rs_member_hosts:
+            if rs_member['name'].split(':')[0] not in rs_member_hosts and \
+               rs_member['stateStr'] != 'ARBITER':
                 hidden_members.append((
+                    rs_member['name'].split(':')[0],
+                    int(rs_member['name'].split(':')[1])
+                ))
+            elif rs_member['stateStr'] == 'SECONDARY':
+                secondaries.append((
                     rs_member['name'].split(':')[0],
                     int(rs_member['name'].split(':')[1])
                 ))
@@ -150,57 +193,68 @@ class AwsMongoBackup(object):
             if rs_member['state'] not in [1, 2, 7]:
                 # primary, secondary, arbiter
                 err_str = "RS member {rs_member} has a state of {state}, "\
-                    "please check RS integrity and try again."\
-                    .format(
+                    "please check RS integrity and try again.".format(
                         rs_member=rs_member['name'],
                         state=rs_member['stateStr']
                     )
                 test_result = False
                 return (test_result, err_str)
-            self.logger.debug("member %s passed state" % rs_member['name'])
+            self.logger.debug("Member %s passed state" % rs_member['name'])
 
             if rs_member.get('health', 1) != 1:
                 err_str = "RS member {rs_member} is marked as unhealthy, "\
-                    "please check RS integrity and try again."\
-                    .format(rs_member=rs_member['name'])
+                    "please check RS integrity and try again.".format(
+                        rs_member=rs_member['name']
+                    )
                 test_result = False
                 return (test_result, err_str)
-            self.logger.debug("member %s passed health" % rs_member['name'])
+            self.logger.debug("Member %s passed health" % rs_member['name'])
 
-            if rs_member.get('pingMs', 0) > 10:
-                err_str = "ping time for RS member {rs_member} is larger than"\
-                    "10ms.  Please check network connectivity and try again."\
-                    .format(rs_member=rs_member['name'])
-                test_result = False
-                return (test_result, err_str)
-            self.logger.debug("member %s passed pingMs" % rs_member['name'])
+            # Arbiters don't have optimeDate and pingMs, skip checks on marbs
+            if rs_member['stateStr'] != 'ARBITER':
+                pingMs = rs_member.get('pingMs', 0)
+                if pingMs > 15:
+                    err_str = "Ping time for RS member {rs_member} is "\
+                        "{pingMs}. Please check network connectivity and try "\
+                        "again.".format(
+                            rs_member=rs_member['name'],
+                            pingMs=pingMs
+                        )
+                    test_result = False
+                    return (test_result, err_str)
+                self.logger.debug("Member %s passed pingMs"
+                                  % rs_member['name'])
 
-            optime_dates.append(rs_member['optimeDate'])
+                optime_dates.append(rs_member['optimeDate'])
 
         self.hidden_members = hidden_members
+        self.secondaries = secondaries
 
-        if (max(optime_dates) - min(optime_dates)).total_seconds() > 5:
-            err_str = "optimeDates is over 5 seconds, there is too much "\
-                "replication lag to continue."
+        replication_lag = (max(optime_dates) -
+                           min(optime_dates)).total_seconds()
+        if replication_lag > 59:
+            err_str = "There's a {replication_lag} seconds replication lag, "\
+                "too much to continue.".format(replication_lag=replication_lag)
             test_result = False
             return (test_result, err_str)
-        self.logger.debug("passed replication lag test")
+        self.logger.debug("Passed replication lag test: {replication_lag} "
+                          "seconds".format(replication_lag=replication_lag))
 
-        if len(self.mongo.secondaries) + len(hidden_members) < 2:
-            err_str = "There needs to be at least two secondaries or a hidden"\
-                " member available to do backups.  Please check RS integrity "\
+        if len(secondaries) + len(hidden_members) < 1:
+            err_str = "There needs to be at least one secondary or a hidden"\
+                " member available to do backups. Please check RS integrity "\
                 "and try again."
             test_result = False
             return (test_result, err_str)
 
-        self.logger.debug("mongo secondaries test passed")
+        self.logger.debug("Mongo secondaries test passed")
 
         if rs_states[1] != 1:
             err_str = "There needs to be one and exactly one mongo primary to"\
-                " do backups.  Please check RS integrity and try again."
+                " do backups. Please check RS integrity and try again."
             test_result = False
             return (test_result, err_str)
-        self.logger.debug("passed primary mongo test")
+        self.logger.debug("Passed primary mongo test")
 
         return (test_result, err_str)
 
@@ -208,7 +262,7 @@ class AwsMongoBackup(object):
         if self.hidden_members:
             return self.hidden_members.pop()
         else:
-            return self.mongo.secondaries.pop()
+            return self.secondaries.pop()
 
     def backup(self):
         # Test that the replica set is in a good state to perform backups
@@ -219,27 +273,18 @@ class AwsMongoBackup(object):
         # Choose a member from which to back up
         backup_member = self.choose_member()
 
-        self._ssh(backup_member[0], self.ssh_opts)
-
-        # Get the instance ID
-        stdin, stdout, stderr = self.ssh.exec_command(
-            '/usr/bin/curl http://169.254.169.254/latest/meta-data/instance-id'
-        )
-
-        instance_id = stdout.readline().rstrip()
-        self.logger.debug("Working on instance %s" % instance_id)
-
-        reservation = self.ec2.get_all_instances(instance_ids=[instance_id, ])
-        instance = reservation[0].instances[0]
-
-        self.logger.debug("got boto ec2 instance %s" % instance)
+        if self.secret:
+            host = 'mongodb://admin:{pw}@{host}:27017'.format(
+                pw=self.secret, host=backup_member[0]),
+        else:
+            host = backup_member[0]
 
         # Connect to the backup target directly
         backup_member_mongo = MongoClient(
-            host=backup_member[0],
+            host=host,
             port=backup_member[1]
         )
-        self.logger.debug("connected to mongo target %s" % backup_member_mongo)
+        self.logger.debug("Connected to mongo target %s" % backup_member_mongo)
 
         freeze_rs = True
         if backup_member_mongo.admin.command('isMaster').get('hidden', False):
@@ -247,115 +292,69 @@ class AwsMongoBackup(object):
             # doing any other maintenance work
             freeze_rs = False
 
-        # Find what volume database data is on
-        cfg = backup_member_mongo.admin.command('getCmdLineOpts')
-
-        cfg_data_volume = cfg['parsed']['dbpath']
-
-        self.logger.debug("found parsed dbpath of %s" % cfg_data_volume)
-
-        stdin, stdout, stderr = self.ssh.exec_command(
-            '/usr/bin/sudo /bin/df {cfg_data_volume} | '
-            '/bin/grep -v "Filesystem"'
-            .format(cfg_data_volume=cfg_data_volume)
-        )
-
-        mount_info = stdout.readline().rstrip()
-        mount_info = mount_info.split(' ')[0]
-
-        self.logger.debug("working on mount %s" % mount_info)
-
-        # Find the matching EBS volume for this mount point
-        volumes = self.ec2.get_all_volumes(
-            filters={'attachment.instance-id': instance_id}
-        )
-
-        data_volume = None
-        for volume in volumes:
-            # There's a strange thing that happens, /dev/sdh1 can magically
-            # become /dev/xdh1 at boot time on instances.  Check for both.
-            volume_mount_point = volume.attach_data.device
-            if volume_mount_point == mount_info or \
-                    volume_mount_point.replace('sd', 'xvd') == mount_info:
-                data_volume = volume
-
-        if data_volume is None:
-            raise RuntimeError("Couldn't find EBS data volume!")
-
-        self.logger.debug("found data volume %s" % data_volume)
-
-        # Remove the member from the replicaset (mark as hidden)
+        # Remove the member from the replica set (mark as hidden)
         if freeze_rs:
             # Can probably use replSetMaintenance here but not available
             # in my testing version
             if self.dryrun:
-                self.logger.debug("Would have frozen replicaset")
+                self.logger.debug("Would have frozen replica set")
             else:
-                self.logger.debug('Freezing replicaset')
+                self.logger.debug('Freezing replica set')
                 backup_member_mongo.admin.command({'replSetFreeze': 86400})
 
         else:
             self.logger.debug(
-                "skipping replicaset freeze, %s is a hidden member"
+                "Skipping replica set freeze, %s is a hidden member"
                 % backup_member[0]
             )
 
-        # Fsynclock mongo
         if self.dryrun:
             self.logger.debug(
-                "Would have fsynclocked {backup_member}"
+                "Would have dumped databases on {backup_member}"
                 .format(backup_member=backup_member)
             )
         else:
             self.logger.debug(
-                "fsync/locking {backup_member}"
+                "Dumping databases on {backup_member}"
                 .format(backup_member=backup_member)
             )
-            backup_member_mongo.fsync(lock=True)
-
-        if self.dryrun:
-            self.logger.debug(
-                "Would have created snapshot of volume {volume}"
-                .format(volume=data_volume)
-            )
-            self.current_snapshot = None
-        else:
-            self.logger.debug("creating snapshot of %s" % data_volume)
-            snapshot = data_volume.create_snapshot(
-                description="mongobackup {date} {replicaset}".format(
-                    date=self.creation_time,
-                    replicaset=self.replicaset)
-            )
-
-            self.current_snapshot = snapshot.id
-
-            tags = {
-                'replicaset': self.replicaset,
-                'sourcehost': backup_member[0],
-                'creation_time': self.creation_time
-            }
-            self.logger.debug(
-                "adding tags %s to snapshot %s" % (tags, snapshot)
-            )
-
-            self.ec2.create_tags(
-                resource_ids=[snapshot.id, ],
-                tags=tags
-            )
+            for database in backup_member_mongo.database_names():
+                if database not in args.exclude_dbs:
+                    mongodump = 'mongodump -h {backup_member} -d {database} '\
+                                '-o {backup_member} --quiet'.format(
+                                    backup_member=backup_member[0],
+                                    database=database
+                                )
+                    if self.secret:
+                        mongodump = '{m} -u admin -p {s} --authenticationDatabase=admin'.format(
+                            m=mongodump, s=self.secret)
+                    mongodump = mongodump.split(' ')
+                    subprocess.check_output(mongodump,
+                                            stderr=subprocess.STDOUT)
 
         # Unlock mongo
         if self.dryrun:
             self.logger.debug("Would have unlocked mongo")
         else:
             if freeze_rs:
-                self.logger.debug('unfreezing replicaset')
+                self.logger.debug('Unfreezing replica set')
                 backup_member_mongo.admin.command({'replSetFreeze': 0})
 
-            self.logger.debug(
-                "unlocking {backup_member}"
-                .format(backup_member=backup_member)
-            )
-            backup_member_mongo.unlock()
+        # Archive and upload to S3
+        if self.dryrun:
+            self.logger.debug("Would have archived dumps and uploaded to S3")
+        else:
+            self.logger.debug("Archiving dumps and uploading to S3")
+            dumps = listdir(backup_member[0])
+            for dump in dumps:
+                archive_path = backup_member[0] + '/' + dump
+                archive_name = dump + '_' + self.creation_time + '.tar.gz'
+                with tarfile.open(archive_name, 'w:gz') as tar:
+                    tar.add(archive_path, arcname=dump)
+                bucket = self.s3.get_bucket(s3_bucket_name)
+                key_obj = key.Key(bucket)
+                key_obj.key = s3_bucket_dest_dir + '/' + archive_name
+                key_obj.set_contents_from_filename(archive_name)
 
 
 if __name__ == '__main__':
@@ -364,42 +363,32 @@ if __name__ == '__main__':
     parser.add_argument(
         "-r",
         "--replicaset",
-        action="store",
         help="Replica set to back up.",
         dest="replicaset",
         required=True
     )
     parser.add_argument(
         "--ec2-filter",
-        action="store",
         help="EC2 API compatible filter with which to find instances, ex. "
              "'tag:replicaset,importantthings' will find instances with the "
-             "tag 'replicaset' and a value of 'importantthings'.  Multiple "
+             "tag 'replicaset' and a value of 'importantthings'. Multiple "
              "filters can be separated with a semicolon.",
         dest="ec2filter",
         required=True
     )
     parser.add_argument(
-        "-k",
-        "--ssh-keyfile",
-        action="store",
-        help="Path to SSH key file to use.",
-        dest="sshkeyfile",
-        required=True
-    )
-    parser.add_argument(
-        "-u",
-        "--user",
-        action="store",
-        help="Username to use to connect over SSH.",
-        dest="sshuser",
-        required=True
+        "--exclude-dbs",
+        help="Names of databases to exclude when dumping, e.g. 'local'. "
+             "Separate multiple values by space, e.g. 'admin local'",
+        dest="exclude_dbs",
+        nargs='*',
+        default=[],
     )
     parser.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
-        help="Don't actually do anything, just print what we would have done",
+        help="Don't actually do anything, just print what we would have done.",
         dest="dryrun"
     )
     args = parser.parse_args()
@@ -410,7 +399,7 @@ if __name__ == '__main__':
     ch.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        '%(asctime)s - %(levelname)s - %(message)s'
     )
 
     ch.setFormatter(formatter)
@@ -419,7 +408,7 @@ if __name__ == '__main__':
     ec2filter = {}
 
     if ',' not in args.ec2filter:
-        raise RuntimeError("ec2filter provided is invalid")
+        raise RuntimeError("EC2 filter provided is invalid")
 
     for x in args.ec2filter.split(';'):
         ec2filter.update(
@@ -429,10 +418,6 @@ if __name__ == '__main__':
     mb = AwsMongoBackup(
         replicaset=args.replicaset,
         filters=ec2filter,
-        ssh_opts={
-            'key_filename': args.sshkeyfile,
-            'username': args.sshuser
-        },
         dryrun=args.dryrun,
         logger=logger
     )
